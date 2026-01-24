@@ -43,6 +43,7 @@ import (
 	"github.com/controlplaneio-fluxcd/flux-operator/internal/builder"
 	"github.com/controlplaneio-fluxcd/flux-operator/internal/inputs"
 	"github.com/controlplaneio-fluxcd/flux-operator/internal/inventory"
+	"github.com/controlplaneio-fluxcd/flux-operator/internal/kubeconfig"
 	"github.com/controlplaneio-fluxcd/flux-operator/internal/notifier"
 	"github.com/controlplaneio-fluxcd/flux-operator/internal/reporter"
 )
@@ -66,6 +67,7 @@ type ResourceSetReconciler struct {
 // +kubebuilder:rbac:groups=fluxcd.controlplane.io,resources=resourcesets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=fluxcd.controlplane.io,resources=resourcesets/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=fluxcd.controlplane.io,resources=resourcesets/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -487,6 +489,10 @@ func (r *ResourceSetReconciler) apply(ctx context.Context,
 		return "", err
 	}
 
+	if err := r.convertKubeConfigResources(ctx, kubeClient, objects); err != nil {
+		return "", err
+	}
+
 	// Compute the sha256 digest of the resources.
 	data, err := ssautil.ObjectsToYAML(objects)
 	if err != nil {
@@ -666,6 +672,88 @@ func (r *ResourceSetReconciler) copyResources(ctx context.Context,
 					return fmt.Errorf("failed to copy data from Secret/%s: %w", source, err)
 				}
 			}
+		}
+	}
+	return nil
+}
+
+// convertKubeConfigResources converts CAPI kubeconfig Secrets to Flux-compatible ConfigMaps
+// based on the annotations set on the resources template.
+func (r *ResourceSetReconciler) convertKubeConfigResources(ctx context.Context,
+	kubeClient client.Client, objects []*unstructured.Unstructured) error {
+	log := ctrl.LoggerFrom(ctx)
+
+	for i := range objects {
+		// Only process ConfigMaps with the conversion annotation
+		if objects[i].GetAPIVersion() == "v1" && objects[i].GetKind() == "ConfigMap" {
+			source, found := objects[i].GetAnnotations()[fluxcdv1.ConvertKubeConfigFromAnnotation]
+			if !found {
+				continue
+			}
+
+			// Parse annotation value (format: namespace/name)
+			sourceParts := strings.Split(source, "/")
+			if len(sourceParts) != 2 {
+				return fmt.Errorf("invalid %s annotation value '%s' must be in the format 'namespace/name'",
+					fluxcdv1.ConvertKubeConfigFromAnnotation, source)
+			}
+
+			sourceName := types.NamespacedName{
+				Namespace: sourceParts[0],
+				Name:      sourceParts[1],
+			}
+
+			// Fetch the kubeconfig Secret
+			secret := &corev1.Secret{}
+			if err := kubeClient.Get(ctx, sourceName, secret); err != nil {
+				return fmt.Errorf("failed to get kubeconfig Secret/%s: %w", source, err)
+			}
+
+			// Extract kubeconfig YAML from Secret
+			// CAPI stores kubeconfig in the 'value' field
+			kubeconfigYAML, ok := secret.StringData["value"]
+			if !ok {
+				// Try Data field if StringData is not set
+				if data, exists := secret.Data["value"]; exists {
+					kubeconfigYAML = string(data)
+				} else {
+					return fmt.Errorf("kubeconfig Secret/%s does not have 'value' field", source)
+				}
+			}
+
+			// Parse and extract server and CA certificate
+			server, caCert, err := kubeconfig.ExtractFluxFields(kubeconfigYAML)
+			if err != nil {
+				return fmt.Errorf("failed to extract fields from kubeconfig Secret/%s: %w", source, err)
+			}
+
+			// Get existing data from ConfigMap template
+			existingData, _, err := unstructured.NestedStringMap(objects[i].Object, "data")
+			if err != nil {
+				return fmt.Errorf("failed to get existing data from ConfigMap: %w", err)
+			}
+			if existingData == nil {
+				existingData = make(map[string]string)
+			}
+
+			// Merge extracted fields (don't overwrite existing template fields)
+			// This allows users to specify provider, serviceAccountName, audiences, etc. in the template
+			if _, exists := existingData["server"]; !exists {
+				existingData["server"] = server
+			}
+			if _, exists := existingData["ca.crt"]; !exists {
+				existingData["ca.crt"] = caCert
+			}
+
+			// Set merged data back to ConfigMap
+			if err := unstructured.SetNestedStringMap(objects[i].Object, existingData, "data"); err != nil {
+				return fmt.Errorf("failed to set data on ConfigMap: %w", err)
+			}
+
+			log.V(1).Info("Converted kubeconfig to ConfigMap",
+				"source", source,
+				"target", fmt.Sprintf("%s/%s", objects[i].GetNamespace(), objects[i].GetName()),
+				"server", server)
 		}
 	}
 	return nil
