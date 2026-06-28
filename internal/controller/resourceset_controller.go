@@ -570,8 +570,9 @@ func (r *ResourceSetReconciler) apply(ctx context.Context,
 			// ApplyAllStaged returns the changeset of the already-completed
 			// stages together with the error; the partial apply results must
 			// enter the inventory so a failed step never orphans applied objects.
+			idx := i
 			return "", stepError(step, "apply failed",
-				trackPartialApply(obj, oldInventory, newInventory, changeSet, err))
+				trackPartialApply(obj, oldInventory, newInventory, changeSet, &idx, err))
 		}
 
 		// Filter out the resources that have changed.
@@ -593,7 +594,8 @@ func (r *ResourceSetReconciler) apply(ctx context.Context,
 		// Track the applied resources in the inventory and keep the union
 		// with the old inventory so a failure mid-sequence never orphans
 		// applied objects and never loses entries owned by later steps.
-		if err := inventory.AddChangeSet(newInventory, changeSet); err != nil {
+		idx := i
+		if err := inventory.AddChangeSetForStep(newInventory, changeSet, &idx); err != nil {
 			return "", err
 		}
 		obj.Status.Inventory = inventory.Merge(oldInventory, newInventory)
@@ -641,7 +643,19 @@ func (r *ResourceSetReconciler) apply(ctx context.Context,
 
 	// Garbage collect stale resources after all the steps have been
 	// applied and all the inter-step health checks have passed.
+	// When the ResourceSet uses steps, delete in reverse step order
+	// (last step first) using the step tags from the old inventory.
 	if len(staleObjects) > 0 {
+		// Reorder stale objects by reverse step order when step
+		// information is available from the old inventory.
+		groups, err := inventory.ListByStepsReversed(oldInventoryForStaleEntries(oldInventory, newInventory))
+		if err != nil {
+			return "", err
+		}
+		if len(groups) == 0 {
+			groups = [][]*unstructured.Unstructured{staleObjects}
+		}
+
 		deleteOpts := ssa.DeleteOptions{
 			PropagationPolicy: metav1.DeletePropagationBackground,
 			Inclusions:        resourceManager.GetOwnerLabels(obj.Name, obj.Namespace),
@@ -650,20 +664,44 @@ func (r *ResourceSetReconciler) apply(ctx context.Context,
 			},
 		}
 
-		deleteSet, err := r.deleteAllStaged(ctx, resourceManager, staleObjects, deleteOpts)
-		if err != nil {
+		var pendingDeletion bool
+		for _, group := range groups {
+			deleteSet, err := r.deleteAllStaged(ctx, resourceManager, group, deleteOpts)
+			if err != nil {
+				// Keep the old and new inventory union in status so the
+				// undeleted stale objects stay tracked and their deletion
+				// is retried on the next reconciliation.
+				return "", err
+			}
+
+			if len(deleteSet.Entries) > 0 {
+				for _, change := range deleteSet.Entries {
+					changeSetLog.WriteString(change.String() + "\n")
+				}
+				log.Info("Garbage collection progress",
+					"output", deleteSet.ToMap())
+			}
+
+			// Check if any object in this group still exists.
+			for _, u := range group {
+				existing := &unstructured.Unstructured{}
+				existing.SetGroupVersionKind(u.GroupVersionKind())
+				if err := r.Client.Get(ctx, client.ObjectKeyFromObject(u), existing); err == nil || !apierrors.IsNotFound(err) {
+					pendingDeletion = true
+					break
+				}
+			}
+
+			if pendingDeletion {
+				break
+			}
+		}
+
+		if pendingDeletion {
 			// Keep the old and new inventory union in status so the
 			// undeleted stale objects stay tracked and their deletion
 			// is retried on the next reconciliation.
-			return "", err
-		}
-
-		if len(deleteSet.Entries) > 0 {
-			for _, change := range deleteSet.Entries {
-				changeSetLog.WriteString(change.String() + "\n")
-			}
-			log.Info("Garbage collection completed",
-				"output", deleteSet.ToMap())
+			return "", fmt.Errorf("waiting for stale resources to be terminated")
 		}
 	}
 
@@ -727,15 +765,38 @@ func (r *ResourceSetReconciler) waitForStep(ctx context.Context,
 // It returns the apply error, joined with the inventory error if any.
 func trackPartialApply(obj *fluxcdv1.ResourceSet,
 	oldInventory, newInventory *fluxcdv1.ResourceInventory,
-	changeSet *ssa.ChangeSet, applyErr error) error {
+	changeSet *ssa.ChangeSet, stepIndex *int, applyErr error) error {
 	if changeSet == nil || len(changeSet.Entries) == 0 {
 		return applyErr
 	}
-	if err := inventory.AddChangeSet(newInventory, changeSet); err != nil {
+	if err := inventory.AddChangeSetForStep(newInventory, changeSet, stepIndex); err != nil {
 		return errors.Join(applyErr, err)
 	}
 	obj.Status.Inventory = inventory.Merge(oldInventory, newInventory)
 	return applyErr
+}
+
+// oldInventoryForStaleEntries returns a new inventory containing only
+// the entries from the old inventory that are not present in the new
+// inventory. The resulting inventory preserves the step tags from the
+// old inventory so that ReverseStepOrder can use them for ordering.
+func oldInventoryForStaleEntries(oldInv, newInv *fluxcdv1.ResourceInventory) *fluxcdv1.ResourceInventory {
+	newIDs := make(map[string]bool)
+	if newInv != nil {
+		for _, entry := range newInv.Entries {
+			newIDs[entry.ID] = true
+		}
+	}
+
+	result := &fluxcdv1.ResourceInventory{}
+	if oldInv != nil {
+		for _, entry := range oldInv.Entries {
+			if !newIDs[entry.ID] {
+				result.Entries = append(result.Entries, entry)
+			}
+		}
+	}
+	return result
 }
 
 // stepLogValues appends the step name to the given log key-value pairs
@@ -943,15 +1004,48 @@ func (r *ResourceSetReconciler) uninstall(ctx context.Context,
 			},
 		}
 
-		objects, _ := inventory.List(obj.Status.Inventory)
-
-		changeSet, err := r.deleteAllStaged(ctx, resourceManager, objects, opts)
+		// Use reverse step order when step information is available
+		// in the inventory, so the last step's objects are deleted first.
+		groups, err := inventory.ListByStepsReversed(obj.Status.Inventory)
 		if err != nil {
-			log.Error(err, "pruning for deleted resource failed")
+			log.Error(err, "listing objects by step failed")
+		}
+		if len(groups) == 0 {
+			objects, _ := inventory.List(obj.Status.Inventory)
+			groups = [][]*unstructured.Unstructured{objects}
 		}
 
-		msg := uninstallMessage(reconcileStart)
-		log.Info(msg, "output", changeSet.ToMap())
+		var pendingDeletion bool
+		for _, group := range groups {
+			changeSet, err := r.deleteAllStaged(ctx, resourceManager, group, opts)
+			if err != nil {
+				log.Error(err, "pruning for deleted resource failed")
+			}
+
+			if len(changeSet.Entries) > 0 {
+				msg := uninstallMessage(reconcileStart)
+				log.Info(msg, "output", changeSet.ToMap())
+			}
+
+			// Check if any object in this group still exists.
+			for _, u := range group {
+				existing := &unstructured.Unstructured{}
+				existing.SetGroupVersionKind(u.GroupVersionKind())
+				if err := r.Client.Get(ctx, client.ObjectKeyFromObject(u), existing); err == nil || !apierrors.IsNotFound(err) {
+					pendingDeletion = true
+					break
+				}
+			}
+
+			if pendingDeletion {
+				break
+			}
+		}
+
+		if pendingDeletion {
+			// Requeue to wait for sequential termination
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
 	} else {
 		log.Error(errors.New("service account not found"), "skip pruning for deleted resource")
 	}

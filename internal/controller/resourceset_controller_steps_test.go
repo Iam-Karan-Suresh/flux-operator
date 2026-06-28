@@ -121,20 +121,24 @@ spec:
 	g.Expect(conditions.GetReason(result, meta.ReadyCondition)).To(BeIdenticalTo(meta.ReconciliationSucceededReason))
 	g.Expect(conditions.Has(result, meta.ReconcilingCondition)).To(BeFalse())
 
-	// Check if the inventory contains the resources of all steps.
+	// Check if the inventory contains the resources of all steps
+	// with step names recorded on each entry.
 	g.Expect(result.Status.Inventory.Entries).To(HaveLen(3))
 	g.Expect(result.Status.Inventory.Entries).To(ContainElements(
 		fluxcdv1.ResourceRef{
 			ID:      fmt.Sprintf("%s_team1-pre__ConfigMap", ns.Name),
 			Version: "v1",
+			Step:    "pre-deploy",
 		},
 		fluxcdv1.ResourceRef{
 			ID:      fmt.Sprintf("%s_team1-app__ConfigMap", ns.Name),
 			Version: "v1",
+			Step:    "deploy",
 		},
 		fluxcdv1.ResourceRef{
 			ID:      fmt.Sprintf("%s_team1-post__ConfigMap", ns.Name),
 			Version: "v1",
+			Step:    "post-deploy",
 		},
 	))
 
@@ -196,12 +200,14 @@ metadata:
 		fluxcdv1.ResourceRef{
 			ID:      fmt.Sprintf("%s_team1-post2__ConfigMap", ns.Name),
 			Version: "v1",
+			Step:    "post-deploy",
 		},
 	))
 	g.Expect(resultFinal.Status.Inventory.Entries).ToNot(ContainElements(
 		fluxcdv1.ResourceRef{
 			ID:      fmt.Sprintf("%s_team1-post__ConfigMap", ns.Name),
 			Version: "v1",
+			Step:    "post-deploy",
 		},
 	))
 
@@ -325,6 +331,7 @@ spec:
 		fluxcdv1.ResourceRef{
 			ID:      fmt.Sprintf("%s_db-migration_batch_Job", ns.Name),
 			Version: "v1",
+			Step:    "db-migration",
 		},
 	))
 
@@ -444,14 +451,17 @@ spec:
 		fluxcdv1.ResourceRef{
 			ID:      fmt.Sprintf("%s_cm1__ConfigMap", ns.Name),
 			Version: "v1",
+			Step:    "first",
 		},
 		fluxcdv1.ResourceRef{
 			ID:      fmt.Sprintf("%s_cm2__ConfigMap", ns.Name),
 			Version: "v1",
+			Step:    "second",
 		},
 		fluxcdv1.ResourceRef{
 			ID:      fmt.Sprintf("%s_blocking-job_batch_Job", ns.Name),
 			Version: "v1",
+			Step:    "first",
 		},
 	))
 
@@ -486,10 +496,12 @@ spec:
 		fluxcdv1.ResourceRef{
 			ID:      fmt.Sprintf("%s_cm1__ConfigMap", ns.Name),
 			Version: "v1",
+			Step:    "first",
 		},
 		fluxcdv1.ResourceRef{
 			ID:      fmt.Sprintf("%s_cm3__ConfigMap", ns.Name),
 			Version: "v1",
+			Step:    "second",
 		},
 	))
 

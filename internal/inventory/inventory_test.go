@@ -13,6 +13,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/fluxcd/cli-utils/pkg/object"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	fluxcdv1 "github.com/controlplaneio-fluxcd/flux-operator/api/v1"
 )
@@ -134,3 +135,190 @@ func readManifest(manifest string) (*ssa.ChangeSet, error) {
 
 	return cs, nil
 }
+
+func Test_AddChangeSetForStep(t *testing.T) {
+	g := NewWithT(t)
+
+	cs := ssa.NewChangeSet()
+	cs.Add(ssa.ChangeSetEntry{
+		ObjMetadata: object.ObjMetadata{
+			Namespace: "default",
+			Name:      "cm1",
+			GroupKind: schema.GroupKind{Kind: "ConfigMap"},
+		},
+		GroupVersion: "v1",
+		Action:       ssa.CreatedAction,
+	})
+	cs.Add(ssa.ChangeSetEntry{
+		ObjMetadata: object.ObjMetadata{
+			Namespace: "default",
+			Name:      "cm2",
+			GroupKind: schema.GroupKind{Kind: "ConfigMap"},
+		},
+		GroupVersion: "v1",
+		Action:       ssa.CreatedAction,
+	})
+
+	t.Run("tags entries with step index", func(t *testing.T) {
+		inv := New()
+		idx := 1
+		err := AddChangeSetForStep(inv, cs, &idx)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(inv.Entries).To(HaveLen(2))
+		for _, entry := range inv.Entries {
+			g.Expect(*entry.StepIndex).To(Equal(1))
+		}
+	})
+
+	t.Run("nil step index leaves step unset", func(t *testing.T) {
+		inv := New()
+		err := AddChangeSetForStep(inv, cs, nil)
+		g.Expect(err).ToNot(HaveOccurred())
+		for _, entry := range inv.Entries {
+			g.Expect(entry.StepIndex).To(BeNil())
+		}
+	})
+
+	t.Run("backward compatible with AddChangeSet", func(t *testing.T) {
+		inv := New()
+		err := AddChangeSet(inv, cs)
+		g.Expect(err).ToNot(HaveOccurred())
+		for _, entry := range inv.Entries {
+			g.Expect(entry.Step).To(BeEmpty())
+		}
+	})
+}
+
+func Test_MergeWithSteps(t *testing.T) {
+	idx1 := 1
+	idx2 := 2
+
+	t.Run("overlay step takes precedence", func(t *testing.T) {
+		g := NewWithT(t)
+
+		base := &fluxcdv1.ResourceInventory{
+			Entries: []fluxcdv1.ResourceRef{
+				{ID: "default_cm1__ConfigMap", Version: "v1", StepIndex: &idx1},
+			},
+		}
+		overlay := &fluxcdv1.ResourceInventory{
+			Entries: []fluxcdv1.ResourceRef{
+				{ID: "default_cm1__ConfigMap", Version: "v1", StepIndex: &idx2},
+			},
+		}
+
+		result := Merge(base, overlay)
+		g.Expect(result.Entries).To(HaveLen(1))
+		g.Expect(*result.Entries[0].StepIndex).To(Equal(2))
+	})
+
+	t.Run("preserves steps from both inventories", func(t *testing.T) {
+		g := NewWithT(t)
+
+		base := &fluxcdv1.ResourceInventory{
+			Entries: []fluxcdv1.ResourceRef{
+				{ID: "default_cm1__ConfigMap", Version: "v1", StepIndex: &idx1},
+			},
+		}
+		overlay := &fluxcdv1.ResourceInventory{
+			Entries: []fluxcdv1.ResourceRef{
+				{ID: "default_cm2__ConfigMap", Version: "v1", StepIndex: &idx2},
+			},
+		}
+
+		result := Merge(base, overlay)
+		g.Expect(result.Entries).To(HaveLen(2))
+		g.Expect(*result.Entries[0].StepIndex).To(Equal(1))
+		g.Expect(*result.Entries[1].StepIndex).To(Equal(2))
+	})
+}
+
+func Test_ListByStepsReversed(t *testing.T) {
+	idx0 := 0
+	idx1 := 1
+	idx2 := 2
+
+	t.Run("returns groups in reverse step order", func(t *testing.T) {
+		g := NewWithT(t)
+
+		inv := &fluxcdv1.ResourceInventory{
+			Entries: []fluxcdv1.ResourceRef{
+				{ID: "default_cm1__ConfigMap", Version: "v1", StepIndex: &idx0},
+				{ID: "default_cm2__ConfigMap", Version: "v1", StepIndex: &idx1},
+				{ID: "default_cm3__ConfigMap", Version: "v1", StepIndex: &idx2},
+			},
+		}
+
+		result, err := ListByStepsReversed(inv)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(result).To(HaveLen(3))
+		// Reverse order: idx2 first, idx0 last.
+		g.Expect(result[0][0].GetName()).To(Equal("cm3"))
+		g.Expect(result[1][0].GetName()).To(Equal("cm2"))
+		g.Expect(result[2][0].GetName()).To(Equal("cm1"))
+	})
+
+	t.Run("handles multiple objects per step", func(t *testing.T) {
+		g := NewWithT(t)
+
+		inv := &fluxcdv1.ResourceInventory{
+			Entries: []fluxcdv1.ResourceRef{
+				{ID: "default_cm1__ConfigMap", Version: "v1", StepIndex: &idx0},
+				{ID: "default_cm2__ConfigMap", Version: "v1", StepIndex: &idx1},
+				{ID: "default_cm3__ConfigMap", Version: "v1", StepIndex: &idx1},
+				{ID: "default_cm4__ConfigMap", Version: "v1", StepIndex: &idx2},
+			},
+		}
+
+		result, err := ListByStepsReversed(inv)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(result).To(HaveLen(3))
+		// idx2 first, then idx1 (2 objects), then idx0.
+		g.Expect(result[0]).To(HaveLen(1))
+		g.Expect(result[0][0].GetName()).To(Equal("cm4"))
+
+		g.Expect(result[1]).To(HaveLen(2))
+		g.Expect(result[1][0].GetName()).To(Equal("cm2"))
+		g.Expect(result[1][1].GetName()).To(Equal("cm3"))
+
+		g.Expect(result[2]).To(HaveLen(1))
+		g.Expect(result[2][0].GetName()).To(Equal("cm1"))
+	})
+
+	t.Run("nil step index entries are deleted first", func(t *testing.T) {
+		g := NewWithT(t)
+
+		inv := &fluxcdv1.ResourceInventory{
+			Entries: []fluxcdv1.ResourceRef{
+				{ID: "default_cm1__ConfigMap", Version: "v1", StepIndex: &idx0},
+				{ID: "default_cm2__ConfigMap", Version: "v1", StepIndex: nil},
+			},
+		}
+
+		result, err := ListByStepsReversed(inv)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(result).To(HaveLen(2))
+		// Nil index first, then idx0.
+		g.Expect(result[0][0].GetName()).To(Equal("cm2"))
+		g.Expect(result[1][0].GetName()).To(Equal("cm1"))
+	})
+
+	t.Run("returns nil for empty inventory", func(t *testing.T) {
+		g := NewWithT(t)
+
+		result, err := ListByStepsReversed(&fluxcdv1.ResourceInventory{})
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(result).To(BeNil())
+	})
+
+	t.Run("returns nil for nil inventory", func(t *testing.T) {
+		g := NewWithT(t)
+
+		result, err := ListByStepsReversed(nil)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(result).To(BeNil())
+	})
+}
+
+
+

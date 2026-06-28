@@ -24,14 +24,21 @@ func New() *fluxcdv1.ResourceInventory {
 
 // AddChangeSet extracts the metadata from the given objects and adds it to the inventory.
 func AddChangeSet(inv *fluxcdv1.ResourceInventory, set *ssa.ChangeSet) error {
+	return AddChangeSetForStep(inv, set, "")
+}
+
+// AddChangeSetForStep extracts the metadata from the given objects and adds
+// it to the inventory, tagging each entry with the given step index.
+func AddChangeSetForStep(inv *fluxcdv1.ResourceInventory, set *ssa.ChangeSet, stepIndex *int) error {
 	if set == nil {
 		return nil
 	}
 
 	for _, entry := range set.Entries {
 		inv.Entries = append(inv.Entries, fluxcdv1.ResourceRef{
-			ID:      entry.ObjMetadata.String(),
-			Version: entry.GroupVersion,
+			ID:        entry.ObjMetadata.String(),
+			Version:   entry.GroupVersion,
+			StepIndex: stepIndex,
 		})
 	}
 
@@ -39,28 +46,25 @@ func AddChangeSet(inv *fluxcdv1.ResourceInventory, set *ssa.ChangeSet) error {
 }
 
 // Merge returns a new inventory with all entries from base plus overlay,
-// deduplicated by entry ID with overlay's version taking precedence,
-// sorted by ID for stable status patches. A nil base or overlay is
-// treated as an empty inventory.
+// deduplicated by entry ID with overlay's version and step taking
+// precedence, sorted by ID for stable status patches. A nil base or
+// overlay is treated as an empty inventory.
 func Merge(base, overlay *fluxcdv1.ResourceInventory) *fluxcdv1.ResourceInventory {
-	versions := make(map[string]string)
+	refs := make(map[string]fluxcdv1.ResourceRef)
 	for _, inv := range []*fluxcdv1.ResourceInventory{base, overlay} {
 		if inv == nil {
 			continue
 		}
 		for _, entry := range inv.Entries {
-			versions[entry.ID] = entry.Version
+			refs[entry.ID] = entry
 		}
 	}
 
 	result := &fluxcdv1.ResourceInventory{
-		Entries: make([]fluxcdv1.ResourceRef, 0, len(versions)),
+		Entries: make([]fluxcdv1.ResourceRef, 0, len(refs)),
 	}
-	for _, id := range slices.Sorted(maps.Keys(versions)) {
-		result.Entries = append(result.Entries, fluxcdv1.ResourceRef{
-			ID:      id,
-			Version: versions[id],
-		})
+	for _, id := range slices.Sorted(maps.Keys(refs)) {
+		result.Entries = append(result.Entries, refs[id])
 	}
 	return result
 }
@@ -150,6 +154,70 @@ func Diff(inv *fluxcdv1.ResourceInventory, target *fluxcdv1.ResourceInventory) (
 
 	sort.Sort(ssa.SortableUnstructureds(objects))
 	return objects, nil
+}
+
+// ListByStepsReversed returns the inventory entries as unstructured objects
+// grouped by step index in reverse order. The returned slice contains groups
+// of objects, ordered such that the objects that should be deleted first (nil
+// index, and highest step index) are at the beginning of the slice. Within each
+// group, the objects are sorted by the default SSA ordering.
+//
+// This is used to delete objects in the reverse order of the steps:
+// the objects of the last step are deleted first, and the objects of
+// the first step are deleted last. Entries not managed by steps are deleted
+// first.
+func ListByStepsReversed(inv *fluxcdv1.ResourceInventory) ([][]*unstructured.Unstructured, error) {
+	if inv == nil || len(inv.Entries) == 0 {
+		return nil, nil
+	}
+
+	byIndex := make(map[int][]fluxcdv1.ResourceRef)
+	var nilIndexEntries []fluxcdv1.ResourceRef
+
+	for _, entry := range inv.Entries {
+		if entry.StepIndex == nil {
+			nilIndexEntries = append(nilIndexEntries, entry)
+		} else {
+			byIndex[*entry.StepIndex] = append(byIndex[*entry.StepIndex], entry)
+		}
+	}
+
+	var orderedIndexes []int
+	for idx := range byIndex {
+		orderedIndexes = append(orderedIndexes, idx)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(orderedIndexes)))
+
+	var result [][]*unstructured.Unstructured
+
+	if len(nilIndexEntries) > 0 {
+		var group []*unstructured.Unstructured
+		for _, entry := range nilIndexEntries {
+			u, err := EntryToUnstructured(entry)
+			if err != nil {
+				return nil, err
+			}
+			group = append(group, u)
+		}
+		sort.Sort(ssa.SortableUnstructureds(group))
+		result = append(result, group)
+	}
+
+	for _, idx := range orderedIndexes {
+		entries := byIndex[idx]
+		var group []*unstructured.Unstructured
+		for _, entry := range entries {
+			u, err := EntryToUnstructured(entry)
+			if err != nil {
+				return nil, err
+			}
+			group = append(group, u)
+		}
+		sort.Sort(ssa.SortableUnstructureds(group))
+		result = append(result, group)
+	}
+
+	return result, nil
 }
 
 // EntryFromObjMetadata converts an object.ObjMetadata to a ResourceRef entry.

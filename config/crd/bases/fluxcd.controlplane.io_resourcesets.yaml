@@ -461,6 +461,11 @@ spec:
                             ID is the string representation of the Kubernetes resource object's metadata,
                             in the format '<namespace>_<name>_<group>_<kind>'.
                           type: string
+                        si:
+                          description: |-
+                            StepIndex is the index of the ResourceSet step that manages this resource.
+                            Nil for resources not managed by a step-based ResourceSet.
+                          type: integer
                         v:
                           description: Version is the API version of the Kubernetes
                             resource object's kind.

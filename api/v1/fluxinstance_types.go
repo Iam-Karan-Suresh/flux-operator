@@ -323,6 +323,11 @@ type ResourceRef struct {
 
 	// Version is the API version of the Kubernetes resource object's kind.
 	Version string `json:"v"`
+
+	// StepIndex is the index of the ResourceSet step that manages this resource.
+	// Nil for resources not managed by a step-based ResourceSet.
+	// +optional
+	StepIndex *int `json:"si,omitempty"`
 }
 
 // FluxInstanceStatus defines the observed state of FluxInstance
